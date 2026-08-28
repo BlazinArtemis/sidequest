@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<!-- No remote anything. A game overlay has zero reason to talk to the network,
+     and a strict CSP is the cheapest way to guarantee it. -->
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;" />
+<title>SideQuest</title>
+<style>
+  :root {
+    --bg: rgba(17, 19, 24, 0.88);
+    --stroke: rgba(255, 255, 255, 0.10);
+    --text: #e8eaf0;
+    --muted: #8b93a6;
+    --accent: #7dd3fc;
+  }
+
+  html, body {
+    margin: 0;
+    height: 100%;
+    /* The window itself is transparent; the card below is the only paint.
+       Never set an opaque body background or the window turns into a rectangle. */
+    background: transparent;
+    overflow: hidden;
+    font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+    color: var(--text);
+    user-select: none;
+    cursor: default;
+  }
+
+  #card {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    box-sizing: border-box;
+    background: var(--bg);
+    border: 1px solid var(--stroke);
+    border-radius: 14px;
+    backdrop-filter: blur(18px);
+    overflow: hidden;
+  }
+
+  header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--stroke);
+    /* Whole header drags the frameless window. */
+    -webkit-app-region: drag;
+  }
+
+  header .tabs { display: flex; gap: 4px; -webkit-app-region: no-drag; }
+
+  button {
+    -webkit-app-region: no-drag;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 7px;
+    color: var(--muted);
+    font: inherit;
+    font-size: 12px;
+    padding: 3px 8px;
+    cursor: pointer;
+  }
+  button:hover { color: var(--text); border-color: var(--stroke); }
+  button.active { color: #0b1220; background: var(--accent); border-color: var(--accent); }
+
+  .spacer { flex: 1; }
+
+  /* "516 / 0" read as a fraction. The star labels the second number as a
+     personal best, which is legible before you have ever lost a game. */
+  #scores { font-variant-numeric: tabular-nums; font-size: 12px; color: var(--muted); white-space: nowrap; }
+  #scores b { color: var(--text); font-weight: 600; }
+  #bestwrap { margin-left: 7px; font-size: 11px; }
+  #bestwrap.beating { color: var(--accent); }
+  #best { margin-left: 2px; }
+
+  #stage { position: relative; flex: 1; min-height: 0; }
+  canvas { display: block; width: 100%; height: 100%; }
+
+  #banner {
+    position: absolute;
+    inset: 0;
+    display: none;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    background: rgba(10, 12, 16, 0.72);
+    text-align: center;
+  }
+  #banner.show { display: flex; }
+  /* The settings panel is translucent by design, and the auto-pause fires the
+     moment it opens — without this the banner's "Paused / P to resume" ghosts
+     through the settings card. Hiding it beats making the panel opaque. */
+  body.settings-open #banner { display: none; }
+  #banner h2 { margin: 0; font-size: 16px; }
+  #banner p { margin: 0; color: var(--muted); font-size: 12px; }
+
+  footer {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    border-top: 1px solid var(--stroke);
+    color: var(--muted);
+    font-size: 11px;
+  }
+  #ct-dot { width: 7px; height: 7px; border-radius: 50%; background: #475069; flex: none; }
+  #ct-dot.on { background: #fbbf24; box-shadow: 0 0 0 3px rgba(251, 191, 36, 0.20); }
+
+  /* Click-through is a mode in which the app deliberately ignores the mouse.
+     Without an obvious signal that reads as "this is on purpose", it is
+     indistinguishable from the app having hung. */
+  body.click-through #card {
+    border-color: rgba(251, 191, 36, 0.55);
+    border-style: dashed;
+  }
+  body.click-through header,
+  body.click-through #stage { opacity: 0.75; }
+  #hint { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+
+  /* What the other side can actually see, on this machine, at a glance. The
+     whole product claim fails silently otherwise: an overlay that is visible
+     in the share looks identical to one that is not, from this side of it. */
+  #capability {
+    flex: none;
+    display: none;
+    align-items: center;
+    gap: 4px;
+    padding: 1px 6px;
+    border-radius: 999px;
+    font-size: 10px;
+    white-space: nowrap;
+    border: 1px solid transparent;
+  }
+  #capability.ready { display: inline-flex; }
+  #capability::before {
+    content: '';
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: currentColor;
+  }
+  /* ---- idle pet -------------------------------------------------------
+     The same window, shrunk. Everything but the canvas gets out of the way,
+     and the card becomes a soft blob rather than a panel so it reads as a
+     creature that wandered in, not as UI that opened itself. */
+  /* The pet crawls on the desktop, so the card disappears entirely — no panel,
+     no border, no blur. The window would then be an invisible click trap in a
+     screen corner, so overlay.js hit-tests the cursor against the snake and
+     only makes the window solid to the mouse when you are actually on it. */
+  body.pet #card {
+    background: transparent;
+    border-color: transparent;
+    backdrop-filter: none;
+    cursor: pointer;
+  }
+  body.pet header, body.pet footer, body.pet #settings, body.pet #banner { display: none !important; }
+  /* Positioned in JS so it tracks the snake as it moves. */
+  #pet-bubble {
+    display: none;
+    position: absolute;
+    padding: 3px 9px;
+    border-radius: 999px;
+    background: var(--accent);
+    color: #0b1220;
+    font-size: 11px;
+    font-weight: 600;
+    white-space: nowrap;
+    transform: translate(-50%, -100%);
+    opacity: 0;
+    transition: opacity 140ms ease;
+    pointer-events: none;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
+  }
+  body.pet #pet-bubble { display: block; }
+  body.pet #pet-bubble.show { opacity: 1; }
+
+  /* Shooing it away has to be as easy as accepting. Right-click anywhere on the
+     creature does it too, but a right-click is not discoverable on its own. */
+  #pet-dismiss {
+    display: none;
+    position: absolute;
+    width: 20px;
+    height: 20px;
+    padding: 0;
+    line-height: 18px;
+    text-align: center;
+    border-radius: 50%;
+    font-size: 11px;
+    color: var(--text);
+    background: rgba(20, 23, 30, 0.92);
+    border: 1px solid rgba(255, 255, 255, 0.22);
+    opacity: 0;
+    transition: opacity 140ms ease;
+    cursor: pointer;
+  }
+  body.pet #pet-dismiss { display: block; }
+  body.pet #pet-dismiss.show { opacity: 1; }
+  #pet-dismiss:hover { background: #f87171; color: #0b1220; border-color: #f87171; }
+
+  /* Avatar picker: the creature itself, not its name. */
+  .pet-picker { display: flex; gap: 6px; -webkit-app-region: no-drag; }
+  .pet-picker button {
+    width: 40px;
+    height: 40px;
+    padding: 0;
+    border: 1px solid var(--stroke);
+    border-radius: 9px;
+    display: grid;
+    place-items: center;
+    background: rgba(255, 255, 255, 0.04);
+  }
+  .pet-picker button.on { border-color: var(--accent); background: rgba(125, 211, 252, 0.16); }
+  .pet-picker button:disabled { opacity: 0.4; cursor: not-allowed; }
+  .pet-picker canvas { width: 34px; height: 34px; display: block; }
+  .pet-picker .rand { font-size: 15px; color: var(--muted); }
+  .pet-picker button.on .rand { color: var(--accent); }
+
+  #capability.reliable   { color: #4ade80; border-color: rgba(74, 222, 128, 0.30); background: rgba(74, 222, 128, 0.10); }
+  #capability.degraded   { color: #fbbf24; border-color: rgba(251, 191, 36, 0.30); background: rgba(251, 191, 36, 0.10); }
+  #capability.unreliable,
+  #capability.none       { color: #f87171; border-color: rgba(248, 113, 113, 0.30); background: rgba(248, 113, 113, 0.10); }
+
+  /* ---- settings ------------------------------------------------------
+     A panel over the stage rather than a second window: one window is the
+     whole architecture (see spec 1.3), and a second one would need its own
+     stealth flags, its own always-on-top ladder and its own positioning. */
+  #settings {
+    position: absolute;
+    inset: 0;
+    display: none;
+    flex-direction: column;
+    background: rgba(13, 15, 20, 0.97);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding: 10px;
+    gap: 8px;
+    box-sizing: border-box;
+  }
+  #settings.show { display: flex; }
+  /* Column flex items shrink below their content by default. With the panel
+     taller than the window that collapses each row onto the next, so the help
+     text lands on top of the control below it. The panel scrolls instead. */
+  #settings > * { flex-shrink: 0; }
+
+  .s-head {
+    display: flex;
+    align-items: center;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--muted);
+    margin-top: 2px;
+  }
+  .s-head .spacer { flex: 1; }
+
+  .s-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    min-height: 24px;
+  }
+  .s-row > .label { flex: 1; color: var(--muted); }
+  .s-row output { font-variant-numeric: tabular-nums; color: var(--text); min-width: 34px; text-align: right; }
+
+  /* Stealth truth-telling card. Colour maps to how much the claim actually
+     holds on this machine, so the demo is never oversold. */
+  #stealth {
+    border: 1px solid var(--stroke);
+    border-radius: 9px;
+    padding: 8px;
+    font-size: 11px;
+    line-height: 1.45;
+    border-left-width: 3px;
+  }
+  #stealth.reliable { border-left-color: #4ade80; }
+  #stealth.degraded { border-left-color: #fbbf24; }
+  #stealth.unreliable, #stealth.none { border-left-color: #f87171; }
+  #stealth b { display: block; color: var(--text); font-size: 12px; margin-bottom: 3px; }
+  #stealth span { color: var(--muted); }
+  #stealth em { display: block; margin-top: 5px; color: var(--accent); font-style: normal; }
+
+  .seg { display: flex; gap: 3px; }
+  .seg button { padding: 3px 6px; font-size: 11px; border-color: var(--stroke); }
+  .seg button.on { color: #0b1220; background: var(--accent); border-color: var(--accent); }
+
+  select, input[type="range"] { -webkit-app-region: no-drag; font: inherit; font-size: 11px; }
+  /* A control that is merely greyed reads as missing rather than switched off,
+     which is how the pet pickers went unnoticed. */
+  select:disabled, input:disabled { opacity: 0.4; cursor: not-allowed; }
+  .s-row:has(select:disabled) > .label { opacity: 0.5; }
+  select {
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--text);
+    border: 1px solid var(--stroke);
+    border-radius: 7px;
+    padding: 3px 6px;
+    max-width: 170px;
+  }
+  input[type="range"] { flex: 1; accent-color: var(--accent); min-width: 0; }
+  input[type="checkbox"] { accent-color: var(--accent); }
+
+  .hk {
+    font-variant-numeric: tabular-nums;
+    border-color: var(--stroke);
+    font-size: 11px;
+    min-width: 128px;
+    text-align: center;
+  }
+  .hk.recording { color: #0b1220; background: #fbbf24; border-color: #fbbf24; }
+
+  /* Help text belongs to the control above it, so pull it closer than the
+     panel's default row gap. */
+  .note { margin: -4px 0 0; font-size: 10.5px; line-height: 1.4; color: var(--muted); }
+  #hk-note { min-height: 13px; }
+  .note.warn { color: #fbbf24; }
+
+  .s-foot {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: auto;   /* pin to the bottom when the panel is short */
+    padding-top: 6px;
+    border-top: 1px solid var(--stroke);
+  }
+  .s-foot .spacer { flex: 1; }
+  #quit { color: #f87171; border-color: var(--stroke); }
+  #build { font-size: 10px; color: var(--muted); line-height: 1.3; }
+</style>
+</head>
+<body>
+  <div id="card">
+    <header>
+      <div class="tabs">
+        <button data-game="tetris">Tetris</button>
+        <button data-game="2048">2048</button>
+        <button data-game="snake">Snake</button>
+      </div>
+      <div class="spacer"></div>
+      <div id="scores" title="This run · your best">
+        <b id="score">0</b><span id="bestwrap">★<span id="best">0</span></span>
+      </div>
+      <button id="pause" title="Pause (P)">❙❙</button>
+      <button id="settings-open" title="Settings">⚙</button>
+      <button id="hide" title="Hide (Esc)">✕</button>
+    </header>
+
+    <div id="stage">
+      <canvas id="canvas"></canvas>
+      <div id="pet-bubble">wanna play?</div>
+      <button id="pet-dismiss" title="Not now (or right-click)">✕</button>
+      <div id="banner">
+        <h2 id="banner-title"></h2>
+        <p id="banner-sub"></p>
+      </div>
+
+      <div id="settings">
+        <div class="s-head">
+          <span>Settings</span>
+          <span class="spacer"></span>
+          <button id="settings-close">Done</button>
+        </div>
+
+        <div id="stealth">
+          <b id="stealth-headline">Checking…</b>
+          <span id="stealth-detail"></span>
+          <em id="stealth-fix"></em>
+        </div>
+
+        <div class="s-head">Window</div>
+
+        <div class="s-row">
+          <span class="label">Opacity</span>
+          <input id="opacity" type="range" min="30" max="100" step="5" value="95" />
+          <output id="opacity-val">95%</output>
+        </div>
+
+        <div class="s-row">
+          <span class="label">Size</span>
+          <input id="scale" type="range" min="80" max="150" step="5" value="100" />
+          <output id="scale-val">100%</output>
+        </div>
+
+        <div class="s-row">
+          <span class="label">Dock</span>
+          <div class="seg" id="docks">
+            <button data-dock="top-left" title="Top left">◤</button>
+            <button data-dock="top-right" title="Top right">◥</button>
+            <button data-dock="bottom-left" title="Bottom left">◣</button>
+            <button data-dock="bottom-right" title="Bottom right">◢</button>
+          </div>
+        </div>
+
+        <div class="s-row">
+          <span class="label">Show on</span>
+          <select id="display" title="Which monitor the overlay opens on"></select>
+        </div>
+        <p class="note">
+          Which monitor the overlay opens on. Choosing one you are not sharing
+          keeps it out of the call entirely — the only approach that works on
+          every OS.
+        </p>
+
+        <div class="s-head">Screen capture</div>
+
+        <div class="s-row">
+          <span class="label">Content protection</span>
+          <input id="content-protection" type="checkbox" title="Ask the OS to exclude this window from screen capture" />
+        </div>
+        <p class="note">
+          Asks the OS to leave this window out of screen capture. What that
+          achieves depends on your platform — see the banner above.
+        </p>
+
+        <div class="s-head">Idle pet</div>
+
+        <div class="s-row">
+          <span class="label">Show a pet</span>
+          <input id="pet-enabled" type="checkbox" />
+          <select id="pet-idle" title="How long the machine must be idle">
+            <option value="30">after 30s</option>
+            <option value="60">after 1 min</option>
+            <option value="120">after 2 min</option>
+            <option value="300">after 5 min</option>
+            <option value="600">after 10 min</option>
+          </select>
+        </div>
+        <div class="s-row">
+          <span class="label">Which pet</span>
+          <div class="pet-picker" id="pet-avatar">
+            <button data-avatar="random" title="Surprise me"><span class="rand">?</span></button>
+            <button data-avatar="snake" title="Snake"><canvas width="68" height="68"></canvas></button>
+            <button data-avatar="pacman" title="Pac-Man"><canvas width="68" height="68"></canvas></button>
+            <button data-avatar="robot" title="Robot"><canvas width="68" height="68"></canvas></button>
+          </div>
+        </div>
+
+        <div class="s-row">
+          <span class="label">Pet size</span>
+          <input id="pet-scale" type="range" min="70" max="180" step="10" value="100" />
+          <output id="pet-scale-val">100%</output>
+        </div>
+
+        <div class="s-row">
+          <span class="label">Appears</span>
+          <select id="pet-position">
+            <option value="cursor">At the mouse</option>
+            <option value="dock">In the dock corner</option>
+          </select>
+        </div>
+        <p class="note" id="idle-live">Idle now: —</p>
+        <p class="note">
+          After this long with no keyboard or mouse input anywhere on the
+          machine, a small creature wanders onto the screen. Click it to play;
+          ignore it and it leaves on its own. It never appears while the game
+          is already open, and it uses the idle counter the OS already keeps —
+          no key or mouse tracking.
+        </p>
+
+        <div class="s-head">Hotkeys</div>
+        <div class="s-row">
+          <span class="label">Show / hide</span>
+          <button class="hk" data-slot="hotkey"></button>
+        </div>
+        <div class="s-row">
+          <span class="label">Click-through</span>
+          <button class="hk" data-slot="clickThroughHotkey"></button>
+        </div>
+        <div class="s-row">
+          <span class="label">Next game</span>
+          <button class="hk" data-slot="cycleGameHotkey"></button>
+        </div>
+        <p class="note" id="hk-note"></p>
+
+        <div class="s-foot">
+          <span id="build"></span>
+          <span class="spacer"></span>
+          <button id="quit">Quit SideQuest</button>
+        </div>
+      </div>
+    </div>
+
+    <footer>
+      <span id="ct-dot"></span>
+      <span id="hint">↑ rotate · ←→ move · space drop</span>
+      <span id="capability"></span>
+    </footer>
+  </div>
+
+  <script src="games/tetris.js"></script>
+  <script src="games/g2048.js"></script>
+  <script src="games/snake.js"></script>
+  <script src="pet.js"></script>
+  <!-- settings.js before overlay.js: overlay's boot() calls SQSettings.init(). -->
+  <script src="settings.js"></script>
+  <script src="overlay.js"></script>
+</body>
+</html>
