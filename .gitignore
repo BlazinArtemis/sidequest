@@ -2,3 +2,7 @@ node_modules/
 dist/
 *.log
 .DS_Store
+
+# Working notes and specs — kept locally, not part of the published repo.
+TASKS.md
+docs/

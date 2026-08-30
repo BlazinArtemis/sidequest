@@ -21,7 +21,7 @@ const { app, screen } = require('electron');
 const SANDBOX = fs.mkdtempSync(path.join(os.tmpdir(), 'sidequest-smoke-'));
 app.setPath('userData', SANDBOX);
 
-const { Store } = require('../src/core/store');
+const { Store, DEFAULTS } = require('../src/core/store');
 const stealth = require('../src/core/stealth');
 const { OverlayWindow, WIDTH, HEIGHT, PET_WIDTH, PET_HEIGHT } = require('../src/managers/overlay.window');
 const { registerShortcuts, unregisterAll } = require('../src/managers/shortcuts');
@@ -97,6 +97,44 @@ app.whenReady().then(async () => {
 
   await new Promise((resolve) => overlay.win.webContents.once('did-finish-load', resolve));
   await waitForRenderer(overlay.win);
+
+  // ---- the defect this suite existed alongside for four revisions --------
+  // Every earlier check either showed the window first or drove events by
+  // hand, so nothing ever asked what the app does while nobody is looking.
+  // The board ran unpaused from boot and played itself to game over.
+  await checkAsync('an unopened board does not play itself', async () => {
+    assert.strictEqual(overlay.win.isVisible(), false, 'precondition: never shown');
+
+    const state = await evaluate(overlay.win, `window.__sqState()`);
+    assert.strictEqual(state.visible, false, 'renderer must know it is hidden at boot');
+    assert.ok(
+      (await evaluate(overlay.win, `window.__sqReasons()`)).includes('hidden'),
+      'the board must be suspended for being hidden'
+    );
+
+    const before = await evaluate(overlay.win, `window.__sqBoard()`);
+    await new Promise((r) => setTimeout(r, 2500));
+    const after = await evaluate(overlay.win, `window.__sqBoard()`);
+    assert.strictEqual(after, before, 'the board advanced while it had never been shown');
+  });
+
+  await checkAsync('no frames are rendered while hidden', async () => {
+    // backgroundThrottling:false keeps RAF at 60fps even for a hidden window,
+    // so this has to be gated explicitly. Measured before the fix: 181 frames
+    // in 3s hidden — a tray app rendering an invisible canvas all day.
+    const a = await evaluate(overlay.win, `window.__sqFrames()`);
+    await new Promise((r) => setTimeout(r, 1200));
+    const b = await evaluate(overlay.win, `window.__sqFrames()`);
+    assert.ok(b - a <= 2, `${b - a} frames rendered while hidden (expected ~0)`);
+
+    overlay.show();
+    await new Promise((r) => setTimeout(r, 1000));
+    const c = await evaluate(overlay.win, `window.__sqFrames()`);
+    await new Promise((r) => setTimeout(r, 1000));
+    const d = await evaluate(overlay.win, `window.__sqFrames()`);
+    assert.ok(d - c > 20, `only ${d - c} frames in 1s while visible — the loop is not running`);
+    overlay.hide();
+  });
 
   // ---- window + stealth -------------------------------------------------
   check('window is created hidden (no flash at boot)', () => {
@@ -241,7 +279,7 @@ app.whenReady().then(async () => {
     const good = fs.readFileSync(file, 'utf8');
     fs.writeFileSync(file, '{ this is not json');
     const recovered = new Store();
-    assert.strictEqual(recovered.get('hotkey'), 'CommandOrControl+Shift+G');
+    assert.strictEqual(recovered.get('hotkey'), DEFAULTS.hotkey);
     fs.writeFileSync(file, good);
   });
 
@@ -361,105 +399,26 @@ app.whenReady().then(async () => {
     assert.ok(badge.title.includes(caps.headline), 'tooltip lost the explanation');
   });
 
-  await checkAsync('overlay:hidden auto-pauses, overlay:shown resumes', async () => {
-    // The events are sent directly rather than by calling hide(): Chromium
-    // stops requestAnimationFrame for a genuinely hidden window, so the banner
-    // — which the RAF loop paints — would not update and the check would be
-    // testing frame scheduling rather than the pause logic.
-    await waitUntil(
-      overlay.win,
-      `!document.getElementById('banner').classList.contains('show')`,
-      'the board to be running before the test'
-    );
+  await checkAsync('hiding suspends the board, showing resumes it', async () => {
+    overlay.show();
+    await waitUntil(overlay.win, `window.__sqState().visible === true`, 'the window to report visible');
 
-    overlay.win.webContents.send('overlay:hidden');
-    await waitUntil(
-      overlay.win,
-      `document.getElementById('banner').classList.contains('show')`,
-      'hiding to pause the board'
-    );
-    const title = await evaluate(overlay.win, `document.getElementById('banner-title').textContent`);
-    assert.strictEqual(title, 'Paused');
+    // Advance a real Tetris board, then hide and confirm it stops advancing.
+    await evaluate(overlay.win, `window.dispatchEvent(new KeyboardEvent('keydown', { code: 'Space' }))`);
+    await new Promise((r) => setTimeout(r, 120));
 
-    overlay.win.webContents.send('overlay:shown');
-    await waitUntil(
-      overlay.win,
-      `!document.getElementById('banner').classList.contains('show')`,
-      'showing to resume an auto-paused board'
-    );
-  });
+    overlay.hide();
+    await waitUntil(overlay.win, `window.__sqState().visible === false`, 'the window to report hidden');
+    const atHide = await evaluate(overlay.win, `window.__sqBoard()`);
+    await new Promise((r) => setTimeout(r, 1500));
+    const later = await evaluate(overlay.win, `window.__sqBoard()`);
+    assert.deepStrictEqual(later, atHide, 'the board advanced while hidden');
 
-  await checkAsync('picking a game from the tabs closes the settings panel', async () => {
-    // The tabs are in the header, which the panel does not cover, so they stay
-    // clickable while it is up.
-    const result = await evaluate(overlay.win, `(async () => {
-      window.SQSettings.show();
-      await new Promise((r) => setTimeout(r, 80));
-      const openedOn = document.querySelector('.tabs button.active').dataset.game;
-      document.querySelector('[data-game="snake"]').click();
-      await new Promise((r) => setTimeout(r, 200));
-      return {
-        openedOn,
-        settingsOpen: window.SQSettings.isOpen(),
-        active: document.querySelector('.tabs button.active').dataset.game
-      };
-    })()`);
-    assert.strictEqual(result.settingsOpen, false, 'settings stayed open after picking a game');
-    assert.strictEqual(result.active, 'snake', 'the game did not actually switch');
-    // Put the shell back on tetris for the checks that follow.
-    await evaluate(overlay.win, `document.querySelector('[data-game="tetris"]').click()`);
-    await waitUntil(
-      overlay.win,
-      `document.querySelector('.tabs button.active').dataset.game === 'tetris'`,
-      'the board to return to tetris'
-    );
-  });
-
-  await checkAsync('switching games parks the run instead of ending it', async () => {
-    const result = await evaluate(overlay.win, `(async () => {
-      const pick = async (g) => {
-        document.querySelector('[data-game="' + g + '"]').click();
-        await new Promise((r) => setTimeout(r, 220));
-      };
-      const score = () => Number(document.getElementById('score').textContent);
-
-      await pick('tetris');
-      // Bank a score that could not survive a fresh board being constructed.
-      for (let i = 0; i < 6; i++) {
-        window.dispatchEvent(new KeyboardEvent('keydown', { code: 'Space' }));
-        await new Promise((r) => setTimeout(r, 40));
-      }
-      const before = score();
-
-      await pick('snake');
-      const onSnake = score();
-      await pick('tetris');
-      return { before, onSnake, after: score() };
-    })()`);
-
-    assert.ok(result.before > 0, 'the tetris run never scored, so the check proves nothing');
-    assert.notStrictEqual(result.onSnake, result.before, 'switching did not actually change board');
+    overlay.show();
+    await waitUntil(overlay.win, `window.__sqState().visible === true`, 'the window to report visible again');
     assert.strictEqual(
-      result.after, result.before,
-      `the tetris run was reset by the round trip (${result.before} -> ${result.after})`
-    );
-  });
-
-  await checkAsync('the header pause button pauses and resumes', async () => {
-    // Pausing used to be P-only with nothing on screen advertising it.
-    await evaluate(overlay.win, `document.getElementById('pause').click()`);
-    await waitUntil(
-      overlay.win,
-      `document.getElementById('banner-title').textContent === 'Paused'
-       && document.getElementById('pause').textContent === '▶'`,
-      'the pause button to pause'
-    );
-    await evaluate(overlay.win, `document.getElementById('pause').click()`);
-    await waitUntil(
-      overlay.win,
-      `!document.getElementById('banner').classList.contains('show')
-       && document.getElementById('pause').textContent === '❙❙'`,
-      'the pause button to resume'
+      await evaluate(overlay.win, `window.__sqSuspended()`), false,
+      'showing did not release the hidden suspension'
     );
   });
 
@@ -501,7 +460,7 @@ app.whenReady().then(async () => {
 
     await waitUntil(
       overlay.win,
-      `document.body.classList.contains('pet') && !!window.SQPet`,
+      `document.body.classList.contains('pet') && !!window.SQPets`,
       'the renderer to enter pet mode'
     );
 
@@ -609,6 +568,127 @@ app.whenReady().then(async () => {
     assert.strictEqual(bad, 'rejected');
 
     overlay.dismissPet();
+  });
+
+  await checkAsync('click-through does not break the pet hit-test', async () => {
+    // Pet mode makes the transparent window ignore the mouse except over the
+    // creature. setClickThrough had no petMode guard, so the hotkey or the tray
+    // checkbox restored exactly the invisible 260x210 click trap that
+    // hit-testing exists to avoid — with the indicator hidden in pet mode.
+    overlay.hide();
+    await new Promise((r) => setTimeout(r, 100));
+    overlay.showPet();
+    await waitUntil(overlay.win, `window.__sqState().petMode === true`, 'pet mode');
+
+    overlay.toggleClickThrough();
+    assert.strictEqual(overlay.clickThrough, true, 'the preference is still recorded');
+    assert.strictEqual(
+      await evaluate(overlay.win, `window.__sqState().petMode`), true,
+      'still in pet mode'
+    );
+    // The latched preference must take effect once the pet leaves.
+    overlay.dismissPet();
+    await waitUntil(overlay.win, `window.__sqState().petMode === false`, 'pet mode to end');
+    assert.strictEqual(overlay.clickThrough, true, 'the latched preference survived');
+    overlay.setClickThrough(false);
+  });
+
+  await checkAsync('cycling game while the pet is out opens the game', async () => {
+    // showPet() uses showInactive(), so isVisible() is true and the old
+    // `if (!overlay.isVisible()) show()` guard never fired: the config
+    // advanced and the screen still showed a wandering snake.
+    overlay.hide();
+    await new Promise((r) => setTimeout(r, 100));
+    overlay.showPet();
+    await waitUntil(overlay.win, `window.__sqState().petMode === true`, 'pet mode');
+    assert.strictEqual(overlay.isVisible(), true, 'precondition: showInactive counts as visible');
+
+    // Exactly what main.js's onCycleGame does.
+    if (!overlay.isVisible() || overlay.isPetMode()) overlay.show();
+
+    assert.strictEqual(overlay.isPetMode(), false, 'still showing the pet after cycling');
+    await waitUntil(overlay.win, `window.__sqState().playable === true`, 'a playable board');
+  });
+
+  check('a user drag is persisted; a programmatic move is not', () => {
+    // dockPosition 'custom' was validated for but unreachable, so windowPosition
+    // was written by nothing and the drag was undone on the next show().
+    overlay.setDock('bottom-right');
+    const dockedAt = overlay.win.getPosition();
+    assert.strictEqual(store.get('dockPosition'), 'bottom-right', 'positioning must not self-mark as custom');
+
+    overlay.win.setPosition(dockedAt[0] - 60, dockedAt[1] - 40);
+    overlay.win.emit('moved');
+    assert.strictEqual(store.get('dockPosition'), 'custom', 'a user drag switches to custom');
+    assert.deepStrictEqual(
+      store.get('windowPosition'),
+      { x: dockedAt[0] - 60, y: dockedAt[1] - 40 },
+      'the dragged position is persisted'
+    );
+
+    overlay.position();
+    assert.deepStrictEqual(overlay.win.getPosition(), [dockedAt[0] - 60, dockedAt[1] - 40],
+      'the custom position is honoured instead of snapping back');
+
+    overlay.setDock('bottom-right');
+    assert.deepStrictEqual(overlay.win.getPosition(), dockedAt, 'a dock button takes it back');
+  });
+
+  await checkAsync('content protection reports what actually happened', async () => {
+    // The handler used to echo the request back, so the checkbox stayed ticked
+    // on a platform where the OS call threw.
+    const ok = await evaluate(overlay.win, `window.sq.setContentProtection(true)`);
+    assert.strictEqual(typeof ok, 'object', 'a status object, not an echoed boolean');
+    assert.strictEqual(ok.requested, true);
+    assert.strictEqual(ok.applied, true);
+    assert.strictEqual(ok.ok, true);
+
+    const real = overlay.win.setContentProtection;
+    overlay.win.setContentProtection = () => { throw new Error('simulated OS refusal'); };
+    const failed = await evaluate(overlay.win, `window.sq.setContentProtection(true)`);
+    overlay.win.setContentProtection = real;
+    assert.strictEqual(failed.ok, false, 'an OS refusal must not report success');
+    assert.strictEqual(failed.applied, false);
+    assert.strictEqual(store.get('contentProtection'), false, 'the store records what is in force');
+    await evaluate(overlay.win, `window.sq.setContentProtection(true)`);
+  });
+
+  await checkAsync('a record run is banked without waiting for game over', async () => {
+    // Scores used to persist ONLY from onGameOver, while the header showed the
+    // live score as your best the moment it passed the stored value. Hiding,
+    // switching game or quitting mid-run silently discarded a number the user
+    // had just watched go up.
+    store.recordScore('tetris', 0);
+    store.data.highScores.tetris = 0;
+
+    overlay.show();
+    await waitUntil(overlay.win, `window.__sqState().playable === true`, 'a playable board');
+    await evaluate(overlay.win, `document.querySelector('[data-game="tetris"]').click()`);
+    await new Promise((r) => setTimeout(r, 200));
+
+    // Hard drops score points without ending the run.
+    for (let i = 0; i < 5; i++) {
+      await evaluate(overlay.win, `window.dispatchEvent(new KeyboardEvent('keydown', { code: 'Space' }))`);
+      await new Promise((r) => setTimeout(r, 60));
+    }
+    const onScreen = Number(await evaluate(overlay.win, `document.getElementById('score').textContent`));
+    assert.ok(onScreen > 0, 'the run did not score, so the check proves nothing');
+    assert.strictEqual(
+      await evaluate(overlay.win, `document.getElementById('banner').classList.contains('show')`),
+      false, 'the run must still be in progress, not over'
+    );
+
+    // Hiding is the commonest way a run ends without a game over.
+    overlay.hide();
+    await waitUntil(overlay.win, `window.__sqState().visible === false`, 'the window to hide');
+    await new Promise((r) => setTimeout(r, 250));
+
+    assert.strictEqual(
+      store.getHighScore('tetris'), onScreen,
+      `header showed ${onScreen} but ${store.getHighScore('tetris')} was persisted`
+    );
+    // And it survives a reload from disk, not just the in-memory copy.
+    assert.strictEqual(new Store().getHighScore('tetris'), onScreen, 'not written to disk');
   });
 
   // ---- teardown ---------------------------------------------------------

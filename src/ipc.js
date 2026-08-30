@@ -5,18 +5,16 @@
 const { ipcMain, app, screen, powerMonitor } = require('electron');
 const stealth = require('./core/stealth');
 
-const GAMES = ['tetris', '2048', 'snake'];
-const DOCKS = ['top-left', 'top-right', 'bottom-left', 'bottom-right', 'custom'];
-const HOTKEY_SLOTS = ['hotkey', 'clickThroughHotkey', 'cycleGameHotkey'];
-const PET_AVATARS = ['snake', 'pacman', 'robot', 'random'];
-const PET_POSITIONS = ['cursor', 'dock'];
+const { GAMES, DOCKS, HOTKEY_SLOTS, PET_AVATARS, PET_POSITIONS } = require('./core/constants');
 
 function registerIpc({ store, overlay, onShortcutsChanged, onStateChanged }) {
   // Anything the tray also displays has to tell the tray when the renderer
   // changes it, or the two views of the same setting drift apart.
   const changed = () => { if (onStateChanged) onStateChanged(); };
 
-  ipcMain.handle('config:get', () => store.all());
+  // The roster travels with the config so the renderer never keeps a second
+  // copy that can drift out of step with the cycle-game hotkey.
+  ipcMain.handle('config:get', () => ({ ...store.all(), games: GAMES }));
 
   ipcMain.handle('config:set-game', (_e, game) => {
     if (!GAMES.includes(game)) throw new Error(`unknown game: ${game}`);
@@ -45,7 +43,6 @@ function registerIpc({ store, overlay, onShortcutsChanged, onStateChanged }) {
     const primaryId = screen.getPrimaryDisplay().id;
     return screen.getAllDisplays().map((d) => ({
       id: d.id,
-      primary: d.id === primaryId,
       label: `${d.size.width}×${d.size.height}${d.id === primaryId ? ' (primary)' : ''}`
     }));
   });
@@ -74,9 +71,13 @@ function registerIpc({ store, overlay, onShortcutsChanged, onStateChanged }) {
   });
 
   ipcMain.handle('config:set-content-protection', (_e, enabled) => {
-    store.set('contentProtection', !!enabled);
-    stealth.setContentProtection(overlay.win, !!enabled);
-    return !!enabled;
+    const wanted = !!enabled;
+    // setContentProtection swallowed OS failures and this handler echoed the
+    // request back, so the checkbox stayed ticked on a platform where the call
+    // threw. Content protection IS the product claim; report the truth.
+    const applied = stealth.setContentProtection(overlay.win, wanted);
+    store.set('contentProtection', applied);
+    return { requested: wanted, applied, ok: applied === wanted };
   });
 
   ipcMain.handle('score:get', (_e, game) => store.getHighScore(game));
@@ -90,12 +91,8 @@ function registerIpc({ store, overlay, onShortcutsChanged, onStateChanged }) {
   });
 
   ipcMain.handle('overlay:hide', () => { overlay.hide(); return true; });
+  ipcMain.handle('overlay:get-state', () => overlay.state());
 
-  ipcMain.handle('overlay:click-through', (_e, on) => {
-    const result = overlay.setClickThrough(on);
-    changed();
-    return result;
-  });
 
   ipcMain.handle('config:set-pet', (_e, { enabled, idleSeconds, avatar, position, scale } = {}) => {
     if (typeof enabled === 'boolean') store.set('petEnabled', enabled);
@@ -148,10 +145,9 @@ function registerIpc({ store, overlay, onShortcutsChanged, onStateChanged }) {
   ipcMain.handle('overlay:capabilities', () => ({
     ...stealth.capabilityReport(),
     version: app.getVersion(),
-    electron: process.versions.electron,
-    displayCount: screen.getAllDisplays().length
+    electron: process.versions.electron
   }));
   ipcMain.handle('app:quit', () => { app.quit(); return true; });
 }
 
-module.exports = { registerIpc, GAMES, DOCKS, HOTKEY_SLOTS, PET_AVATARS, PET_POSITIONS };
+module.exports = { registerIpc };

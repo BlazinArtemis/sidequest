@@ -96,12 +96,19 @@ function applyStealth(win, { contentProtection = true } = {}) {
   win.on('closed', () => clearInterval(iv));
 }
 
+// Returns what is actually in force, which is not always what was asked for.
+// This used to return nothing and swallow failures, so the caller echoed the
+// request back and the settings checkbox stayed ticked on a platform where the
+// OS call threw. Content protection is the product's central claim; a silent
+// failure there is the worst kind.
 function setContentProtection(win, enabled) {
-  if (!win || win.isDestroyed()) return;
+  if (!win || win.isDestroyed()) return false;
   try {
     win.setContentProtection(!!enabled);
+    return !!enabled;
   } catch (err) {
     console.warn('[stealth] setContentProtection unavailable:', err.message);
+    return false;
   }
 }
 
@@ -113,7 +120,13 @@ function hideFromDock() {
   }
 }
 
-// Optional cosmetic disguise, copied in spirit from OpenCluely's setupStealth().
+// DELIBERATELY NEVER CALLED. Kept per spec 1.4, which argues the code should
+// exist and stay off: renaming the process only changes the Activity Monitor
+// label, not the bundle id, the signature or the executable path, so it fools
+// nobody who looks — while making a legitimate app look like malware to a
+// security reviewer. If you are grepping for why this is unreferenced, that is
+// the reason; do not "fix" it by wiring it up.
+//
 // This only changes what Activity Monitor / Task Manager show. It is NOT a
 // security measure and it does not affect capture behaviour.
 function disguiseProcess(name = 'Terminal') {

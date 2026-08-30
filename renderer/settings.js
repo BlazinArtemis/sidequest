@@ -23,6 +23,8 @@
   const dockButtons = Array.from(document.querySelectorAll('[data-dock]'));
   const displaySelect = document.getElementById('display');
   const cpCheckbox = document.getElementById('content-protection');
+  const cpNote = document.getElementById('cp-note');
+  const CP_NOTE = cpNote ? cpNote.textContent : '';
   const petEnabled = document.getElementById('pet-enabled');
   const petIdle = document.getElementById('pet-idle');
   const petAvatarButtons = Array.from(document.querySelectorAll('#pet-avatar [data-avatar]'));
@@ -223,7 +225,20 @@
     root.sq.setDisplay(v === 'cursor' || v === 'secondary' ? v : Number(v));
   });
 
-  cpCheckbox.addEventListener('change', () => root.sq.setContentProtection(cpCheckbox.checked));
+  cpCheckbox.addEventListener('change', async () => {
+    // The handler used to echo the request back, so the box stayed ticked even
+    // when the OS refused. Content protection is the product's central claim;
+    // show what is actually in force.
+    const res = await root.sq.setContentProtection(cpCheckbox.checked);
+    cpCheckbox.checked = !!(res && res.applied);
+    if (res && res.ok === false) {
+      cpNote.textContent = 'The system refused this. Nothing is being excluded from capture.';
+      cpNote.classList.add('warn');
+    } else {
+      cpNote.textContent = CP_NOTE;
+      cpNote.classList.remove('warn');
+    }
+  });
 
   const petControls = [petIdle, petPosition, petScaleInput, ...petAvatarButtons];
   petEnabled.addEventListener('change', () => {
@@ -396,7 +411,6 @@
     show,
     close,
     toggle,
-    isOpen: () => open,
-    isRecording: () => !!recording
+    isOpen: () => open
   };
 })(window);

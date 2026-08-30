@@ -11,7 +11,8 @@ const { IdleWatcher } = require('./src/core/idle');
 const stealth = require('./src/core/stealth');
 const { OverlayWindow } = require('./src/managers/overlay.window');
 const { registerShortcuts, unregisterAll } = require('./src/managers/shortcuts');
-const { registerIpc, GAMES } = require('./src/ipc');
+const { registerIpc } = require('./src/ipc');
+const { GAMES } = require('./src/core/constants');
 
 // A second instance would register the same global hotkeys and lose the race,
 // leaving the user with a hotkey that does nothing.
@@ -56,7 +57,10 @@ app.whenReady().then(() => {
       if (overlay.win && !overlay.win.isDestroyed()) {
         overlay.win.webContents.send('overlay:set-game', next);
       }
-      if (!overlay.isVisible()) overlay.show();
+      // showPet() uses showInactive(), so isVisible() is true while the pet is
+      // out — the old `!isVisible()` guard never fired and the user got a
+      // silent game change behind a wandering snake. show() exits pet mode.
+      if (!overlay.isVisible() || overlay.isPetMode()) overlay.show();
     }
   });
 
@@ -75,6 +79,17 @@ app.whenReady().then(() => {
   watchDisplays();
   watchIdle();
   console.log('[sidequest] ready — tray installed, overlay hidden');
+}).catch((err) => {
+  // Without this the app becomes unreachable AND unquittable: no window, no
+  // Dock icon, no tray, just a process. process.on('uncaughtException') does
+  // not catch promise rejections, so this handler is the only safety net.
+  console.error('[sidequest] startup failed:', err && err.stack ? err.stack : err);
+  try {
+    if (!tray) createTray();
+  } catch (trayErr) {
+    console.error('[sidequest] tray could not be installed either:', trayErr.message);
+    app.quit();
+  }
 });
 
 // A throw in whenReady would otherwise leave a tray-less, window-less process

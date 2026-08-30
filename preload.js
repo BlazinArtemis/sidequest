@@ -34,15 +34,15 @@ contextBridge.exposeInMainWorld('sq', {
   submitScore: (game, score) => ipcRenderer.invoke('score:submit', { game, score }),
 
   hide: () => ipcRenderer.invoke('overlay:hide'),
-  setClickThrough: (on_) => ipcRenderer.invoke('overlay:click-through', on_),
+  getState: () => ipcRenderer.invoke('overlay:get-state'),
   capabilities: () => ipcRenderer.invoke('overlay:capabilities'),
   quit: () => ipcRenderer.invoke('app:quit'),
 
-  onShown: on('overlay:shown'),
-  onHidden: on('overlay:hidden'),
+  // One idempotent state push replaces overlay:shown / overlay:hidden /
+  // overlay:pet-mode / overlay:click-through. Edge events could be missed —
+  // none was sent at boot — and a missed edge left the renderer running a game
+  // loop in a window it wrongly believed was on screen.
+  onState: on('overlay:state'),
   onSetGame: on('overlay:set-game'),
-  onClickThrough: on('overlay:click-through'),
-  onOpenSettings: on('overlay:open-settings'),
-  onPetMode: on('overlay:pet-mode'),
-  onPetScale: on('overlay:pet-scale')
+  onOpenSettings: on('overlay:open-settings')
 });

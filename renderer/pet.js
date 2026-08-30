@@ -257,7 +257,6 @@
   }
 
   root.SQPets = { snake: SnakePet, pacman: PacmanPet, robot: RobotPet };
-  root.SQPet = SnakePet; // the original single-avatar name
 
   // Draw one avatar, centred and still, for the settings picker. A list of
   // words makes you guess what you are choosing; showing the creature does not.

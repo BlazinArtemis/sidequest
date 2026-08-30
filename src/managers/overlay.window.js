@@ -4,7 +4,7 @@
 // one thing that would give the overlay away.
 
 const path = require('path');
-const { BrowserWindow, screen, shell } = require('electron');
+const { BrowserWindow, screen } = require('electron');
 const stealth = require('../core/stealth');
 
 const WIDTH = 340;
@@ -56,10 +56,7 @@ class OverlayWindow {
     const n = Number(value);
     const clamped = Number.isFinite(n) ? Math.min(1.8, Math.max(0.7, n)) : 1;
     this.store.set('petScale', clamped);
-    if (this.petMode) {
-      this.applySize();
-      this.win.webContents.send('overlay:pet-scale', clamped);
-    }
+    if (this.petMode) this.applySize();
     return clamped;
   }
 
@@ -100,18 +97,23 @@ class OverlayWindow {
         preload: path.join(__dirname, '..', '..', 'preload.js'),
         contextIsolation: true,
         nodeIntegration: false,
-        sandbox: false,
+        // The renderer loads only local files under a strict CSP and never
+        // renders remote or user-supplied content, so nothing here needs Node.
+        // The preload uses only contextBridge + ipcRenderer, both of which
+        // remain available to a sandboxed preload.
+        sandbox: true,
         backgroundThrottling: false // keep the game loop running when unfocused
       }
     });
 
     this.win.loadFile(path.join(__dirname, '..', '..', 'renderer', 'overlay.html'));
 
-    // A game overlay has no business navigating anywhere. Deny everything.
-    this.win.webContents.setWindowOpenHandler(({ url }) => {
-      if (/^https?:\/\//i.test(url)) shell.openExternal(url);
-      return { action: 'deny' };
-    });
+    // A game overlay has no business navigating anywhere, and it has no
+    // outbound links — so nothing is handed to shell.openExternal. That branch
+    // used to exist and was reachable from any window.open() call, which the
+    // CSP does not block; there was no way to reach it in practice, but it was
+    // a hole waiting for the first feature that added a link.
+    this.win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
     this.win.webContents.on('will-navigate', (e) => e.preventDefault());
 
     stealth.applyStealth(this.win, {
@@ -121,19 +123,66 @@ class OverlayWindow {
     this.win.setOpacity(this.store.get('opacity'));
     this.position();
 
-    // Remember a free-dragged position so the window reopens where the user left it.
+    // Free-drag. The header is a drag region, so the user can always move the
+    // window; previously that move was silently undone on the next show(),
+    // because the position was only saved when dockPosition was already
+    // 'custom' — a value no UI could produce. Dragging now switches to
+    // 'custom' itself, and the dock buttons switch back.
     this.win.on('moved', () => {
-      if (this.store.get('dockPosition') !== 'custom') return;
+      if (!this.win || this.win.isDestroyed()) return;
       const [x, y] = this.win.getPosition();
+      // Our own placement, echoed back. (A drag that lands exactly on the dock
+      // position is indistinguishable, and harmless — it is already there.)
+      if (this._placedAt === `${x},${y}`) return;
+      this.store.set('dockPosition', 'custom');
       this.store.set('windowPosition', { x, y });
     });
 
     return this.win;
   }
 
+  // The renderer's single source of truth for what the window is doing.
+  //
+  // This replaces the old overlay:shown / overlay:hidden / overlay:pet-mode
+  // events. Those were edge-triggered, and two edges were never sent: nothing
+  // fired at boot, and dismissPet() hid the window without one. The renderer
+  // therefore ran a 60fps game loop against a window it believed was visible,
+  // which is how an unattended board played itself to game over before the
+  // user ever opened it. State is idempotent; a missed edge cannot desync it.
+  pushState() {
+    if (!this.win || this.win.isDestroyed()) return;
+    this.win.webContents.send('overlay:state', this.state());
+  }
+
+  state() {
+    const visible = this.isVisible();
+    return {
+      visible,
+      petMode: this.petMode,
+      clickThrough: this.clickThrough,
+      // "Is a game actually on screen for the user to play?" Pet mode shows a
+      // creature, not a board, so the board must stay parked.
+      playable: visible && !this.petMode
+    };
+  }
+
   // Place the window according to the stored dock preference, on whichever
   // display the cursor is on. Always called BEFORE show() so the window never
   // flashes at its old coordinates.
+  // setPosition also emits 'moved', so every programmatic move has to be
+  // distinguishable from a user drag or the window would rewrite its own dock
+  // preference to 'custom' every time it was shown.
+  place(x, y) {
+    const rx = Math.round(x);
+    const ry = Math.round(y);
+    // Remember where we put it rather than setting a time-boxed "ignore the
+    // next moved event" flag: 'moved' is emitted asynchronously, so a flag
+    // cleared on a timer is a race, and it swallows a real drag that happens
+    // to land inside the window. Comparing coordinates is exact.
+    this._placedAt = `${rx},${ry}`;
+    this.win.setPosition(rx, ry);
+  }
+
   position() {
     if (!this.win || this.win.isDestroyed()) return;
 
@@ -147,7 +196,7 @@ class OverlayWindow {
       const a = screen.getDisplayNearestPoint(pt).workArea;
       const x = Math.max(a.x, Math.min(a.x + a.width - w, Math.round(pt.x - w / 2)));
       const y = Math.max(a.y, Math.min(a.y + a.height - h, Math.round(pt.y - h / 2)));
-      return this.win.setPosition(x, y);
+      return this.place(x, y);
     }
 
     // A free-dragged position belongs to the full-size window; the pet always
@@ -160,7 +209,7 @@ class OverlayWindow {
           const b = d.workArea;
           return p.x >= b.x - w && p.x <= b.x + b.width && p.y >= b.y - h && p.y <= b.y + b.height;
         });
-        if (onScreen) return this.win.setPosition(p.x, p.y);
+        if (onScreen) return this.place(p.x, p.y);
       }
     }
 
@@ -173,7 +222,7 @@ class OverlayWindow {
       'bottom-right': [dx + width - w - MARGIN, dy + height - h - MARGIN]
     };
     const [x, y] = positions[dock] || positions['bottom-right'];
-    this.win.setPosition(Math.round(x), Math.round(y));
+    this.place(x, y);
   }
 
   // Resize between game and pet. The window is deliberately not resizable by
@@ -198,17 +247,17 @@ class OverlayWindow {
     if (this.clickThrough) this.setClickThrough(false);
     this.win.show();
     this.win.focus();          // required: the game reads keydown in the renderer
-    this.win.webContents.send('overlay:shown');
+    this.pushState();
   }
 
   hide() {
     if (!this.win || this.win.isDestroyed()) return;
     this.exitPet();
-    // Tell the renderer first so it can auto-pause before the window vanishes;
-    // otherwise a hidden Tetris board keeps dropping pieces.
-    this.win.webContents.send('overlay:hidden');
     this.win.hide();
     this.applySize();
+    // Ordering no longer matters: the renderer suspends on state, not on an
+    // edge, so a late push cannot leave a board running in a hidden window.
+    this.pushState();
   }
 
   toggle() {
@@ -225,7 +274,7 @@ class OverlayWindow {
       if (!this.win.isFocused()) {
         if (this.clickThrough) this.setClickThrough(false);
         this.win.focus();
-        this.win.webContents.send('overlay:shown');
+        this.pushState();
         return true;
       }
       this.hide();
@@ -258,10 +307,10 @@ class OverlayWindow {
     // against the snake and calls setPetInteractive(true) when you are on it.
     // `forward: true` is what keeps mousemove flowing so that can work at all.
     this.win.setIgnoreMouseEvents(true, { forward: true });
-    this.win.webContents.send('overlay:pet-mode', true);
     // showInactive, not show: this appears unprompted, so it must never take
     // focus from whatever the user left on screen.
     this.win.showInactive();
+    this.pushState();
     this.armPetLinger();
     return true;
   }
@@ -292,7 +341,6 @@ class OverlayWindow {
     if (this.win && !this.win.isDestroyed()) {
       // Hand the mouse back to whatever the user actually chose.
       this.win.setIgnoreMouseEvents(this.clickThrough, { forward: true });
-      this.win.webContents.send('overlay:pet-mode', false);
     }
   }
 
@@ -301,6 +349,7 @@ class OverlayWindow {
     this.exitPet();
     if (this.win && !this.win.isDestroyed()) this.win.hide();
     this.applySize();
+    this.pushState();
   }
 
   // The pet was clicked: grow into the real window and hand over focus.
@@ -315,8 +364,15 @@ class OverlayWindow {
   setClickThrough(on) {
     if (!this.win || this.win.isDestroyed()) return this.clickThrough;
     this.clickThrough = !!on;
-    this.win.setIgnoreMouseEvents(this.clickThrough, { forward: true });
-    this.win.webContents.send('overlay:click-through', this.clickThrough);
+    // In pet mode the window is transparent and deliberately ignores the mouse
+    // except where the creature is; applying the preference now would restore
+    // exactly the invisible 260x210 click trap that hit-testing exists to
+    // avoid, with no visible indicator (the footer is hidden in pet mode).
+    // Latch the choice — exitPet() applies it when the pet leaves.
+    if (!this.petMode) {
+      this.win.setIgnoreMouseEvents(this.clickThrough, { forward: true });
+    }
+    this.pushState();
     return this.clickThrough;
   }
 

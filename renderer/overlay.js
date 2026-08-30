@@ -32,18 +32,51 @@
   let best = 0;
   let last = 0;
   let raf = 0;
-  let hiddenPause = false;   // paused because the overlay was hidden
-  let settingsPause = false; // paused because the settings panel is up
 
   // One live instance per game, kept for the session. Switching tabs used to
   // construct a fresh board, which silently threw away a run in progress —
   // the games are now parked, not discarded.
   const instances = {};
   const submitted = {};      // id -> score already recorded for this game-over
-  const switchPaused = {};   // id -> we paused it on the way out, so we may resume it
 
   let pet = null;            // the idle creature, when the window is pet-sized
-  let petMode = false;
+  let roster = [];           // canonical game order, supplied by main
+
+  // Authoritative window state, owned by main. Never inferred here: the
+  // renderer used to guess from edge events that were not sent at boot, which
+  // is how an unopened board played itself to game over in the background.
+  let winState = { visible: false, petMode: false, clickThrough: false, playable: false };
+  const petMode = () => winState.petMode;
+
+  // ---- suspension --------------------------------------------------------
+  // A board advances only when nothing is suspending it. This replaces three
+  // separate booleans (hiddenPause / settingsPause / switchPaused) that were
+  // mutated from six handlers and had to encode "did we pause it, or did the
+  // user?". Now the user's own pause is just game.paused, which the shell never
+  // touches, and everything else is a named reason in this set.
+  const suspensions = {};    // gameId -> Set of reason strings
+
+  function reasons(id) {
+    if (!suspensions[id]) suspensions[id] = new Set();
+    return suspensions[id];
+  }
+
+  function suspend(id, reason) {
+    if (!id) return;
+    reasons(id).add(reason);
+  }
+
+  function release(id, reason) {
+    if (!id) return;
+    reasons(id).delete(reason);
+  }
+
+  // True when the board must not advance: the window is not showing a playable
+  // game, the panel is over it, or the user paused it themselves.
+  function halted() {
+    if (!game || !gameId) return true;
+    return reasons(gameId).size > 0 || game.paused || game.gameOver;
+  }
 
   const settingsOpen = () => !!(window.SQSettings && window.SQSettings.isOpen());
 
@@ -64,36 +97,24 @@
     const Ctor = window.SQGames[id];
     if (!Ctor) return;
 
-    // Park the outgoing board instead of abandoning it.
-    if (game && gameId && gameId !== id && !game.paused && !game.gameOver) {
-      game.input('pause');
-      switchPaused[gameId] = true;
+    // Park the outgoing board instead of abandoning it, and bank anything it
+    // achieved — a record run left by switching tabs used to be lost.
+    if (game && gameId && gameId !== id) {
+      suspend(gameId, 'switched');
+      persistScore(gameId, game.score);
     }
 
     gameId = id;
     if (!instances[id]) instances[id] = new Ctor();
     game = instances[id];
+    release(id, 'switched');
 
-    // Resume only what we paused on the way out — a board the player paused
-    // with P stays paused, the same rule the hide/show path follows.
-    if (switchPaused[id] && game.paused) {
-      game.input('pause');
-      switchPaused[id] = false;
-    }
-
-    hiddenPause = false;
-    settingsPause = false;
     // Keys held during the switch belong to the old board.
     clearHeld();
 
-    // The game tabs live in the header, which the settings panel does not
-    // cover — so a game can be swapped while the panel is up. Without this the
-    // new board would run behind the panel, and closing the panel would then
-    // pause it (the resume path fires against a flag set for the old game).
-    if (settingsOpen() && !game.paused && !game.gameOver) {
-      game.input('pause');
-      settingsPause = true;
-    }
+    // Reasons that depend on current conditions rather than on transitions, so
+    // they are recomputed on every load rather than tracked incrementally.
+    syncSuspension();
 
     best = await window.sq.getHighScore(id);
     // A parked run may already be beating the stored best.
@@ -120,6 +141,21 @@
     banner.classList.add('show');
   }
 
+  // Bank a score without waiting for game over.
+  //
+  // Scores used to persist ONLY from onGameOver, while the header showed the
+  // live score as your best the moment it passed the stored value. Hide, switch
+  // game or quit mid-run and the number you had just watched go up was never
+  // written — silent loss, made worse by a UI that implied it was saved.
+  // recordScore() only writes on an improvement, so this is idempotent.
+  let lastPersisted = {};
+  function persistScore(id, score) {
+    if (!id || !Number.isFinite(score) || score <= 0) return;
+    if (lastPersisted[id] === score) return;
+    lastPersisted[id] = score;
+    window.sq.submitScore(id, score).catch(() => {});
+  }
+
   async function onGameOver() {
     if (submitted[gameId]) return;
     submitted[gameId] = true;
@@ -133,8 +169,29 @@
   }
 
   // ---- loop -------------------------------------------------------------
+  // Frames are scheduled ONLY while the window is on screen.
+  //
+  // backgroundThrottling:false keeps the loop alive when the window is merely
+  // unfocused (needed for click-through mode) — but it also defeated
+  // throttling while HIDDEN, which is where this app spends almost all of its
+  // life. Measured before this change: 60fps rendering into an invisible
+  // canvas, all day, on a tray app meant to sit beside a video call.
+  function scheduleFrames() {
+    const shouldRun = winState.visible;
+    if (shouldRun && !raf) {
+      last = 0;
+      raf = requestAnimationFrame(frame);
+    } else if (!shouldRun && raf) {
+      cancelAnimationFrame(raf);
+      raf = 0;
+    }
+  }
+
+  let frameCount = 0;
+
   function frame(now) {
     raf = requestAnimationFrame(frame);
+    frameCount++;
 
     // Clamp dt: a backgrounded or stalled window can hand us a multi-second
     // delta, which would teleport the snake across the board on resume.
@@ -143,7 +200,7 @@
 
     // Pet mode owns the canvas: the games are parked and must not tick, or a
     // Tetris run would quietly top out while the creature wanders about.
-    if (petMode) {
+    if (petMode()) {
       if (pet) {
         pet.tick(dt, canvas.clientWidth, canvas.clientHeight);
         pet.render(ctx, canvas.clientWidth, canvas.clientHeight);
@@ -162,7 +219,9 @@
     if (!game) return;
 
     drainRepeats(now);
-    game.tick(dt);
+    // The board advances only when nothing is suspending it. At boot that
+    // includes 'hidden', which is why an unopened game no longer plays itself.
+    if (!halted()) game.tick(dt);
     game.render(ctx, canvas.clientWidth, canvas.clientHeight, THEME);
     scoreEl.textContent = game.score;
     // Track the best live rather than only revealing it on game over: the
@@ -220,6 +279,11 @@
     // settings.js owns the keyboard while its panel is up — it handles Esc in
     // the capture phase, and arrow keys there belong to the slider, not Tetris.
     if (settingsOpen()) return;
+    // In pet mode `game` is a live parked board that is not on screen. Without
+    // this, R would restart a hidden run and arrows would feed it input the
+    // player could not see. showInactive() should mean the pet never holds
+    // focus, but that is a macOS window-level detail, not a guarantee.
+    if (petMode()) return;
 
     if (e.code === 'Escape') { window.sq.hide(); return; }
     if (e.code === 'Comma' && (e.metaKey || e.ctrlKey)) { window.SQSettings.show(); return; }
@@ -278,8 +342,9 @@
     // A held key must not keep firing into a paused board, and its keyup may
     // never arrive if the pause came from the button rather than the keyboard.
     clearHeld();
-    // The pause was deliberate, so don't let unhiding undo it.
-    hiddenPause = false;
+    // No bookkeeping needed any more: a user pause lives in game.paused, which
+    // the shell never touches, so nothing can silently undo it.
+    persistScore(gameId, game.score);
     syncPauseButton();
   }
 
@@ -297,8 +362,10 @@
   pauseBtn.addEventListener('click', togglePause);
 
   function cycle() {
-    const order = ['tetris', '2048', 'snake'];
-    load(order[(order.indexOf(gameId) + 1) % order.length]);
+    // roster comes from main (src/core/constants.js) so Tab and the cycle
+    // hotkey can never iterate different lists.
+    if (!roster.length) return;
+    load(roster[(roster.indexOf(gameId) + 1) % roster.length]);
   }
 
   // The tabs sit in the header, which the settings panel does not cover — so
@@ -313,28 +380,53 @@
   // ---- main-process events ---------------------------------------------
   window.sq.onSetGame((id) => load(id));
 
-  window.sq.onHidden(() => {
-    // Auto-pause so a hidden board isn't quietly losing the run.
-    clearHeld();
-    if (game && !game.paused && !game.gameOver) { game.input('pause'); hiddenPause = true; }
+  // Recompute every suspension reason from current conditions. Idempotent, so
+  // it can be called from anywhere without tracking who suspended what.
+  function syncSuspension() {
+    if (!gameId) return;
+    const playable = winState.visible && !winState.petMode;
+    if (playable) release(gameId, 'hidden'); else suspend(gameId, 'hidden');
+    if (settingsOpen()) suspend(gameId, 'settings'); else release(gameId, 'settings');
+    if (halted()) clearHeld();
+  }
+
+  // The single window-state handler. Main pushes this on every transition and
+  // the renderer also asks for it at boot, so there is no edge to miss.
+  window.sq.onState((next) => {
+    const wasVisible = winState.visible;
+    const wasPet = winState.petMode;
+    winState = next || winState;
+
+    document.body.classList.toggle('pet', winState.petMode);
+    ctDot.classList.toggle('on', !!winState.clickThrough);
+    hint.textContent = winState.clickThrough
+      ? 'click-through ON — mouse passes under, keys still play'
+      : (HINTS[gameId] || '');
+
+    if (winState.petMode && !wasPet) enterPetMode();
+    if (!winState.petMode && wasPet) leavePetMode();
+
+    // Anything that just went off screen should bank what it earned.
+    if (wasVisible && !winState.visible) persistScore(gameId, game && game.score);
+
+    syncSuspension();
+    if (winState.visible && !wasVisible) {
+      last = 0;          // discard the delta accumulated while hidden
+      resize();
+    }
+    scheduleFrames();
   });
 
-  window.sq.onShown(() => {
-    last = 0; // discard the dt accumulated while hidden
-    if (game && hiddenPause && game.paused) { game.input('pause'); hiddenPause = false; }
-    resize();
-  });
-
-  // Same rationale as the hide auto-pause: a board left running behind the
+  // Same rationale as the hidden reason: a board left running behind the
   // settings panel quietly loses the run while the user changes their opacity.
   window.addEventListener('sq:settings-open', () => {
-    clearHeld();
-    if (game && !game.paused && !game.gameOver) { game.input('pause'); settingsPause = true; }
+    persistScore(gameId, game && game.score);
+    syncSuspension();
   });
 
   window.addEventListener('sq:settings-close', () => {
     last = 0; // the panel may have been up for a while; drop the stale delta
-    if (game && settingsPause && game.paused) { game.input('pause'); settingsPause = false; }
+    syncSuspension();
   });
 
   // ---- idle pet ---------------------------------------------------------
@@ -354,30 +446,24 @@
     return all[keys[Math.floor(Math.random() * keys.length)]];
   }
 
-  window.sq.onPetMode((on) => {
-    petMode = !!on;
-    document.body.classList.toggle('pet', petMode);
-
-    if (petMode) {
-      // Park whatever was mid-run; the pet is not a reason to lose a game.
-      if (game && !game.paused && !game.gameOver) {
-        game.input('pause');
-        switchPaused[gameId] = true;
-      }
-      clearHeld();
-      pet = new (pickAvatar())(petScale);
-    } else {
-      pet = null;
-      // The window changed size, so the canvas backing store is now wrong.
-      if (game && switchPaused[gameId] && game.paused) {
-        game.input('pause');
-        switchPaused[gameId] = false;
-      }
-    }
+  // Pet mode is driven by the window-state handler above; these two just build
+  // and tear down the creature. The board is parked by the 'hidden' suspension
+  // reason, not here — the pet is never a reason to lose a run.
+  function enterPetMode() {
+    pet = new (pickAvatar())(petScale);
     last = 0;
     // The resize happens in main; wait a frame so clientWidth reflects it.
     requestAnimationFrame(resize);
-  });
+  }
+
+  function leavePetMode() {
+    pet = null;
+    petNear = false;
+    petBubble.classList.remove('show');
+    petDismiss.classList.remove('show');
+    last = 0;
+    requestAnimationFrame(resize);
+  }
 
   const card = document.getElementById('card');
   const petBubble = document.getElementById('pet-bubble');
@@ -389,14 +475,14 @@
   const petDismiss = document.getElementById('pet-dismiss');
 
   card.addEventListener('click', () => {
-    if (petMode) window.sq.petPlay();
+    if (petMode()) window.sq.petPlay();
   });
 
   // Right-click anywhere on the creature shoos it away. Saying no has to be as
   // cheap as saying yes, and it cannot be "move the mouse away" — you have to
   // approach the thing to interact with it at all.
   card.addEventListener('contextmenu', (e) => {
-    if (!petMode) return;
+    if (!petMode()) return;
     e.preventDefault();
     window.sq.petDismiss();
   });
@@ -410,7 +496,7 @@
   // these events arrive only because setIgnoreMouseEvents was given
   // `forward: true`. Without that this handler would never run.
   card.addEventListener('mousemove', (e) => {
-    if (!petMode || !pet) return;
+    if (!petMode() || !pet) return;
     const near = Math.hypot(e.clientX - pet.x, e.clientY - pet.y) <= PET_REACH;
     if (near === petNear) return;
     petNear = near;
@@ -423,22 +509,13 @@
   });
 
   card.addEventListener('mouseleave', () => {
-    if (!petMode || !petNear) return;
+    if (!petMode() || !petNear) return;
     petNear = false;
     window.sq.petInteractive(false);
     petBubble.classList.remove('show');
     petDismiss.classList.remove('show');
   });
 
-  window.sq.onClickThrough((on) => {
-    ctDot.classList.toggle('on', !!on);
-    document.body.classList.toggle('click-through', !!on);
-    // When the mouse passes through, keyboard still works only if the window
-    // has focus, so tell the user plainly what state they're in.
-    hint.textContent = on
-      ? 'click-through ON — mouse passes under, keys still play'
-      : (HINTS[gameId] || '');
-  });
 
   // ---- boot -------------------------------------------------------------
   // The badge answers "can they see this right now?" without opening Settings.
@@ -454,12 +531,33 @@
       (caps.recommendation ? `\n\n${caps.recommendation}` : '');
   }
 
+  // Read-only diagnostics for the integration tests. No behaviour depends on
+  // these; they exist because the window lifecycle is otherwise unobservable
+  // from outside, which is precisely how a board that played itself while
+  // hidden shipped with a green test suite.
+  window.__sqState = () => ({ ...winState });
+  window.__sqSuspended = () => halted();
+  window.__sqReasons = () => (gameId ? [...reasons(gameId)] : []);
+  window.__sqBoard = () => (game ? JSON.stringify(game) : null);
+  window.__sqFrames = () => frameCount;
+
   (async function boot() {
     const cfg = await window.sq.getConfig();
     petAvatar = cfg.petAvatar || 'random';
     petScale = cfg.petScale || 1;
-    await load(cfg.lastGame || 'tetris');
-    raf = requestAnimationFrame(frame);
+    roster = Array.isArray(cfg.games) && cfg.games.length ? cfg.games : Object.keys(window.SQGames);
+
+    // Ask main what the window is doing BEFORE starting anything. Waiting for
+    // a pushed event was the original defect: none is sent at boot, so the
+    // renderer assumed it was visible and ran the game in a hidden window.
+    winState = await window.sq.getState();
+    document.body.classList.toggle('pet', winState.petMode);
+
+    // A stored game id that no longer exists must not leave a blank canvas.
+    const wanted = roster.includes(cfg.lastGame) ? cfg.lastGame : roster[0];
+    await load(wanted);
+
+    scheduleFrames();
     // Settings render after the game so the first paint is the board, not
     // chrome — the panel is hidden until asked for anyway.
     await window.SQSettings.init();

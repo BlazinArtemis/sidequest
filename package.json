@@ -10,9 +10,10 @@
     "start": "electron .",
     "dev": "electron . --enable-logging",
     "test:games": "node test/games.test.js",
+    "test:store": "node test/store.test.js",
     "test:idle": "node test/idle.test.js",
     "test:smoke": "electron test/smoke.electron.js",
-    "test": "npm run test:games && npm run test:idle && npm run test:smoke",
+    "test": "npm run test:games && npm run test:store && npm run test:idle && npm run test:smoke",
     "icons": "node build/make-tray-icon.js && node build/make-app-icon.js",
     "build:mac": "electron-builder --mac",
     "build:win": "electron-builder --win",
@@ -26,18 +27,48 @@
   "build": {
     "appId": "com.sidequest.overlay",
     "productName": "SideQuest",
-    "directories": { "output": "dist" },
+    "directories": {
+      "output": "dist"
+    },
     "afterPack": "build/after-pack.js",
-    "files": ["main.js", "preload.js", "src/**/*", "renderer/**/*", "build/*.png", "!test/**/*"],
+    "files": [
+      "main.js",
+      "preload.js",
+      "src/**/*",
+      "renderer/**/*",
+      "build/*.png",
+      "!test/**/*"
+    ],
     "mac": {
       "category": "public.app-category.games",
-      "target": [{ "target": "dmg", "arch": ["arm64", "x64"] }],
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        }
+      ],
       "extendInfo": {
         "LSUIElement": true
       }
     },
     "win": {
-      "target": [{ "target": "nsis", "arch": ["x64"] }, { "target": "portable", "arch": ["x64"] }]
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
     },
     "nsis": {
       "oneClick": false,
